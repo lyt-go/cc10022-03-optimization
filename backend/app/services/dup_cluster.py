@@ -12,11 +12,102 @@ class DupClusterService(BaseModuleService):
     MODULE = "dup_cluster"
     ENTITY = "重复簇"
     OPERATION_TERM = "合并"
-    LIST_FIELDS = ["簇编号", "实体模型", "簇大小", "相似度均值", "匹配规则", "创建时间", "处置状态", "处置批次"]
+    LIST_FIELDS = ["簇编号", "实体模型", "簇大小", "相似度均值", "匹配规则", "创建时间", "处置状态", "处置批次", "成员"]
     REQUIRED_FIELDS = ["簇编号", "实体模型", "簇大小"]
     STATUS_ORDER = ["待确认", "审核中", "已合并", "已排除"]
     ACTION_RULES = {"加入审核": "审核中", "确认合并": "已合并", "排除误判": "已排除"}
     NEGATIVE_ACTIONS = []
+
+    def register_clusters_from_round(self, round_result: dict[str, Any],
+                                     entity_model: str, *,
+                                     batch_label: str | None = None,
+                                     source_job: str | None = None,
+                                     only_members: bool = True) -> list[dict[str, Any]]:
+        """把一轮匹配输出的疑似重复簇登记为待确认簇。
+
+        每条簇都带成员（客户简称字段值）、簇大小、相似度均值，以及本轮实际
+        使用的输入签名和规则签名；审核人员据此确认哪些客户可能重复。
+        """
+        rows = store.rows(self.MODULE)
+        next_id = max((int(r.get("id", 0)) for r in rows), default=0)
+        batch = batch_label or source_job or round_result.get("input_signature", "")
+        registered: list[dict[str, Any]] = []
+        for detail in round_result.get("cluster_details", []):
+            if only_members and detail.get("簇大小", 0) < 2:
+                continue
+            next_id += 1
+            member_records = [member.get("字段值", {}) for member in detail.get("成员", [])]
+            # 单字段规则直接展示简称；多字段规则用 | 连接，审核人员一眼能对上记录。
+            members = [
+                "|".join(str(value) for value in record.values())
+                for record in member_records
+            ]
+            row = {
+                "id": next_id,
+                "status": "待确认",
+                "pending": True,
+                "abnormal": False,
+                "簇编号": f"DUP-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{next_id}",
+                "实体模型": entity_model,
+                "簇大小": str(detail.get("簇大小", len(members))),
+                "相似度均值": f"{float(detail.get('相似度均值', 0.0)):.4f}",
+                "匹配规则": str(round_result.get("rule_id", "")),
+                "创建时间": datetime.datetime.utcnow().isoformat(),
+                "处置状态": "待确认",
+                "处置批次": batch,
+                # 审核证据：簇成员及其简称为审核人员提供直接依据
+                "成员索引": detail.get("成员索引", []),
+                "成员": members,
+                "members": members,
+                "成员记录": member_records,
+                "输入签名": round_result.get("input_signature"),
+                "规则签名": round_result.get("rule_signature"),
+                "规则版本": round_result.get("rule_version"),
+                "相似度阈值": str(round_result.get("threshold")),
+                "匹配任务": source_job,
+            }
+            rows.append(row)
+            registered.append(row)
+        return registered
+
+    def submit_batch_dedup(self, rule_id: int, records: list[dict[str, Any]],
+                           entity_model: str = "customer", *,
+                           batch_label: str | None = None) -> dict[str, Any]:
+        """提交整批去重：分别用旧实现和优化实现跑同一批记录并比较结果。
+
+        优化实现登记疑似重复簇；同时返回两版实现的簇成员和实做评分次数，
+        便于确认优化没有改变原口径，并且确实少做了无效比较。
+        """
+        from app.services.match_rule import MatchRuleService
+        rule_svc = MatchRuleService()
+        comparison = rule_svc.compare_match_implementations(rule_id, records)
+        if not comparison.get("ok"):
+            return comparison
+        optimized = comparison["optimized"]
+        registered: list[dict[str, Any]] = []
+        if optimized.get("review_ready"):
+            registered = self.register_clusters_from_round(
+                optimized, entity_model, batch_label=batch_label,
+                source_job="整批去重",
+            )
+        return {
+            "ok": True,
+            "entity_model": entity_model,
+            "legacy_members": comparison["legacy_members"],
+            "optimized_members": comparison["optimized_members"],
+            "clusters_equal": comparison["clusters_equal"],
+            "legacy_scoring_calls": comparison["legacy_scoring_calls"],
+            "optimized_scoring_calls": comparison["optimized_scoring_calls"],
+            "optimized_sequence_matcher_calls": comparison["optimized_sequence_matcher_calls"],
+            "scoring_calls_saved": comparison["scoring_calls_saved"],
+            "legacy_rule_lookups": comparison["legacy_rule_lookups"],
+            "optimized_rule_lookups": comparison["optimized_rule_lookups"],
+            "review_ready": optimized["review_ready"],
+            "可供审核": optimized["可供审核"],
+            "registered_clusters": registered,
+            "registered_count": len(registered),
+            "round": optimized,
+        }
 
     def merge_duplicate_cluster(self, cluster_id: int, records: list[dict[str, Any]]) -> dict[str, Any]:
         """合并重复簇：将簇内多条重复记录归并为一条代表记录。

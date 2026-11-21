@@ -69,6 +69,38 @@ npm run dev
 | 主数据查询接口 | `mdm_api` | 查询接口 | 接口编号、实体模型、查询字段 |
 | 主数据治理看板 | `mdm_dashboard` | 看板配置 | 看板编号、看板名称、监控实体 |
 
+## 批量匹配性能
+
+`app/services/match_rule.py` 的 `run_match_round` 是一轮批量匹配的唯一入口：
+
+- **规则只解析一次**：轮次开始时把规则复制成 `MatchRuleSpec` 快照，整轮打分都使用这份
+  快照（`rule_lookups == 1`），不再为每个记录对重新读取规则。
+- **先算上界再打分**：对每个字段用长度上界和字符多重集重叠上界求相似度上界，
+  四舍五入后仍低于阈值的组合直接跳过，不调用 `SequenceMatcher`。上界是严格成立的，
+  因此不会漏掉任何达标组合。
+- **口径不变**：保留下来的组合仍按原公式打分，`分数 >= 阈值`（临界分数算达标）
+  建立连边，再对连边做连通分量，所以 A 与 C 即使不直接达标，经 B 连通仍在同一簇。
+- **一轮一个口径**：规则与输入都在锁定状态下复制快照；计算期间运营人员更正阈值，
+  本轮仍按开始时的快照输出，任务会被标记 `可供审核=不可审核`，审核人员不会拿到
+  混用两种参数的簇。
+
+相关接口（`app/routers/match.py`）：
+
+| 接口 | 用途 |
+| --- | --- |
+| `POST /api/match/round` | 执行一轮匹配，返回簇、规则/输入签名和实做评分次数 |
+| `POST /api/match/jobs` | 调度自动匹配任务，并把簇成员/簇数登记到疑似重复簇 |
+| `POST /api/match/dedup` | 整批去重：旧实现与优化实现对照后再登记簇 |
+| `GET /api/match/jobs/{id}/review` | 取审核名单；任务不可审核时返回原因 |
+| `POST /api/match/rules/{id}/parameters` | 运营人员更正规则阈值 |
+
+自检脚本（在 `backend` 目录）：
+
+```bash
+.venv/bin/python app/tests/test_match_optimization.py   # 8 项口径/并发/性能测试
+.venv/bin/python app/tests/demo_match_optimization.py   # abc / abcd / bcd 实操演示
+```
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。
